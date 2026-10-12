@@ -37,10 +37,12 @@ class AudioCaptureService {
     // Advanced VAD Engine
     this.vad = new VoiceActivityDetector({
       sampleRate: 44100,
-      speechThreshold: 0.58,
-      candidateThreshold: 0.46,
-      minCandidateFrames: 6, // ~150-200ms sustained speech
+      speechThreshold: 0.50,
+      candidateThreshold: 0.38,
+      minCandidateFrames: 4, // ~80-120ms sustained speech
       silenceTimeoutSeconds: 15,
+      hangoverMs: 1000,
+      debugMode: true,
       onStateChange: (state) => {
         if (this.onLifecycleChange) {
           this.onLifecycleChange(state);

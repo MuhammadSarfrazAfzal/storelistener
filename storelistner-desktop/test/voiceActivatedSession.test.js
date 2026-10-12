@@ -1,5 +1,5 @@
 /**
- * Storelistener Desktop — Voice-Activated Sessions & Translation Test Suite (Module 4)
+ * Storelistener Desktop — Voice-Activated Sessions & Acoustic VAD Test Suite (Module 4)
  * File: test/voiceActivatedSession.test.js
  */
 
@@ -9,226 +9,295 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-describe('Module 4: Automatic Voice-Activated Session State Machine', () => {
-  // Pure model of the session state machine
-  class MockSessionStateMachine {
-    constructor() {
-      this.state = 'IDLE'; // 'IDLE' | 'SPEECH_DETECTED' | 'ACTIVE_SESSION' | '15_SECONDS_CONTINUOUS_SILENCE' | 'SAVE_AND_CLOSE'
-      this.currentSessionId = null;
-      this.currentTitle = null;
-      this.continuousSilenceSeconds = 0;
-      this.sessionsCreated = [];
-      this.savedSessions = [];
+import { VoiceActivityDetector } from '../src/services/vadService.js';
+
+// --- Synthetic Acoustic Signal Generators for VAD Verification ---
+
+function createQuietFrame(length = 256) {
+  const freq = new Uint8Array(length);
+  const time = new Uint8Array(length * 2);
+  // Quiet room: minimal ambient noise floor (~ -58 dBFS)
+  for (let i = 0; i < length; i++) freq[i] = Math.floor(Math.random() * 4);
+  for (let i = 0; i < length * 2; i++) time[i] = 128 + Math.floor((Math.random() - 0.5) * 4);
+  return { freq, time };
+}
+
+function createFanNoiseFrame(length = 256) {
+  const freq = new Uint8Array(length);
+  const time = new Uint8Array(length * 2);
+  // Fan/AC: strong 60Hz hum in low bins (bins 0-2) + flat broadband noise (high SFM)
+  freq[0] = 75; // 60Hz hum
+  freq[1] = 60; // 120Hz harmonic
+  for (let i = 2; i < length; i++) {
+    freq[i] = 25 + Math.floor(Math.random() * 6); // Flat stationary noise
+  }
+  for (let i = 0; i < length * 2; i++) {
+    // 60Hz motor hum (lag > 700 samples, well below speech pitch register) + random air turbulence
+    time[i] = 128 + Math.floor(Math.sin(i * 0.0085) * 20 + (Math.random() - 0.5) * 12);
+  }
+  return { freq, time };
+}
+
+function createKeyboardClickFrame(length = 256) {
+  const freq = new Uint8Array(length);
+  const time = new Uint8Array(length * 2);
+  // Keyboard click: sudden wideband spike with very high crest factor (> 5.0)
+  for (let i = 0; i < length; i++) freq[i] = 20 + Math.floor(Math.random() * 30);
+  for (let i = 0; i < length * 2; i++) time[i] = 128;
+  // Sharp Dirac-like transient impulse in first few samples
+  time[10] = 250;
+  time[11] = 8;
+  time[12] = 240;
+  time[13] = 20;
+  return { freq, time };
+}
+
+function createTrafficRumbleFrame(length = 256) {
+  const freq = new Uint8Array(length);
+  const time = new Uint8Array(length * 2);
+  // Traffic rumble: high energy strictly below 150Hz (bins 0-3), near zero in speech band
+  freq[0] = 90;
+  freq[1] = 80;
+  freq[2] = 50;
+  for (let i = 3; i < length; i++) freq[i] = Math.floor(Math.random() * 4);
+  for (let i = 0; i < length * 2; i++) {
+    time[i] = 128 + Math.floor(Math.sin(i * 0.05) * 40);
+  }
+  return { freq, time };
+}
+
+function createHumanSpeechFrame(length = 256, pitchHz = 150) {
+  const freq = new Uint8Array(length);
+  const time = new Uint8Array(length * 2);
+  // Formant bandwidths: F1 (~500Hz: bins 5-8), F2 (~1500Hz: bins 15-20), F3 (~2500Hz: bins 26-32)
+  for (let b = 5; b <= 8; b++) freq[b] = 120;
+  for (let b = 15; b <= 20; b++) freq[b] = 100;
+  for (let b = 26; b <= 32; b++) freq[b] = 80;
+
+  // Periodic pitch waveform with 150Hz fundamental
+  const samplesPerPeriod = Math.floor(44100 / pitchHz);
+  for (let i = 0; i < length * 2; i++) {
+    const phase = (i % samplesPerPeriod) / samplesPerPeriod;
+    const sample = Math.sin(phase * 2 * Math.PI) * 45 + Math.sin(phase * 4 * Math.PI) * 25;
+    time[i] = 128 + Math.floor(sample);
+  }
+  return { freq, time };
+}
+
+describe('Module 4: Acoustic Feature-Based Voice Activity Detection (VAD)', () => {
+  test('Requirement 1: Quiet room: classified as non-speech with near-zero probability', () => {
+    const vad = new VoiceActivityDetector({ sampleRate: 44100 });
+    const { freq, time } = createQuietFrame();
+    const result = vad.processFrame(freq, time);
+
+    assert.equal(result.isSpeech, false, 'Quiet room must not be speech');
+    assert.ok(result.speechProbability < 0.20, `Quiet room probability (${result.speechProbability}) must be < 0.20`);
+    assert.equal(vad.lifecycleState, 'IDLE');
+  });
+
+  test('Requirement 2: Fan or Air-Conditioning noise: rejected as non-speech due to high spectral flatness and rumble', () => {
+    const vad = new VoiceActivityDetector({ sampleRate: 44100 });
+    // Process 20 frames of continuous fan noise
+    let maxProbability = 0;
+    for (let f = 0; f < 20; f++) {
+      const { freq, time } = createFanNoiseFrame();
+      const res = vad.processFrame(freq, time);
+      if (res.speechProbability > maxProbability) maxProbability = res.speechProbability;
     }
 
-    onAudioFrame({ isSpeaking, elapsedSilenceSeconds = 0 }) {
-      if (this.state === 'IDLE') {
-        if (isSpeaking) {
-          this.state = 'SPEECH_DETECTED';
-          const sessId = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-          const now = new Date();
-          const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-          const title = `Conversation - ${now.getDate()} ${months[now.getMonth()]} ${now.getFullYear()}, ${now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-          
-          this.currentSessionId = sessId;
-          this.currentTitle = title;
-          this.sessionsCreated.push({ sessionId: sessId, title });
-          this.continuousSilenceSeconds = 0;
-          this.state = 'ACTIVE_SESSION';
-        }
-      } else if (this.state === 'ACTIVE_SESSION') {
-        if (isSpeaking) {
-          // Speech continues or resumes: reset silence timer
-          this.continuousSilenceSeconds = 0;
-        } else {
-          // Silence continues
-          this.continuousSilenceSeconds = elapsedSilenceSeconds;
-          if (this.continuousSilenceSeconds >= 15) {
-            this.state = '15_SECONDS_CONTINUOUS_SILENCE';
-            this.finalizeAndClose();
-          }
-        }
+    assert.ok(maxProbability < 0.40, `Fan noise probability (${maxProbability}) must be well below speech threshold`);
+    assert.equal(vad.lifecycleState, 'IDLE', 'Fan noise alone must never leave IDLE');
+  });
+
+  test('Requirement 3: Keyboard typing & occasional clicks: rejected by high crest factor transient detector', () => {
+    const vad = new VoiceActivityDetector({ sampleRate: 44100 });
+    // Simulate quiet typing: quiet frame, sudden click, quiet frame
+    vad.processFrame(createQuietFrame().freq, createQuietFrame().time);
+    const clickRes = vad.processFrame(createKeyboardClickFrame().freq, createKeyboardClickFrame().time);
+    vad.processFrame(createQuietFrame().freq, createQuietFrame().time);
+
+    assert.equal(clickRes.isSpeech, false, 'Keyboard clicks must be classified as non-speech');
+    assert.ok(clickRes.features.crestFactor > 4.0, 'Click must have high crest factor');
+    assert.equal(vad.lifecycleState, 'IDLE', 'Isolated click must not start session');
+  });
+
+  test('Requirement 4: Traffic / low-frequency rumble: rejected due to low speech-to-rumble ratio', () => {
+    const vad = new VoiceActivityDetector({ sampleRate: 44100 });
+    let maxProbability = 0;
+    for (let f = 0; f < 15; f++) {
+      const { freq, time } = createTrafficRumbleFrame();
+      const res = vad.processFrame(freq, time);
+      if (res.speechProbability > maxProbability) maxProbability = res.speechProbability;
+    }
+
+    assert.ok(maxProbability < 0.35, `Traffic rumble probability (${maxProbability}) must be < 0.35`);
+    assert.equal(vad.lifecycleState, 'IDLE', 'Traffic rumble must not trigger session');
+  });
+
+  test('Requirement 5: Clear human speech: transitions IDLE -> SPEECH_CANDIDATE -> CONFIRMED_SPEECH -> ACTIVE_RECORDING', () => {
+    let confirmedEventFired = false;
+    const statesObserved = [];
+
+    const vad = new VoiceActivityDetector({
+      sampleRate: 44100,
+      minCandidateFrames: 5,
+      onStateChange: (state) => statesObserved.push(state),
+      onConfirmedSpeech: () => { confirmedEventFired = true; },
+    });
+
+    // Feed 10 consecutive frames of human speech (~200ms)
+    for (let f = 0; f < 10; f++) {
+      const { freq, time } = createHumanSpeechFrame();
+      vad.processFrame(freq, time);
+    }
+
+    assert.ok(confirmedEventFired, 'Confirmed speech callback must be triggered');
+    assert.ok(statesObserved.includes('SPEECH_CANDIDATE'), 'Must enter SPEECH_CANDIDATE first');
+    assert.ok(statesObserved.includes('CONFIRMED_SPEECH'), 'Must enter CONFIRMED_SPEECH');
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', 'Must transition to ACTIVE_RECORDING');
+  });
+
+  test('Requirement 6: Short pause during conversation (< 15s): session remains active and resets silence timer upon speech', () => {
+    let silenceTimeoutFired = false;
+    let countdownValues = [];
+
+    const vad = new VoiceActivityDetector({
+      sampleRate: 44100,
+      minCandidateFrames: 3,
+      silenceTimeoutSeconds: 15,
+      onSilenceCountdown: (rem) => { if (rem !== null) countdownValues.push(rem); },
+      onSilenceTimeout: () => { silenceTimeoutFired = true; },
+    });
+
+    // 1. Establish speech session
+    for (let i = 0; i < 5; i++) {
+      const { freq, time } = createHumanSpeechFrame();
+      vad.processFrame(freq, time);
+    }
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING');
+
+    // 2. Pause for a short period (non-speech frames)
+    for (let i = 0; i < 10; i++) {
+      const { freq, time } = createQuietFrame();
+      vad.processFrame(freq, time);
+    }
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', 'Session must remain active during short pause');
+    assert.equal(silenceTimeoutFired, false, '15s silence must not trigger prematurely');
+
+    // 3. Speech resumes
+    for (let i = 0; i < 4; i++) {
+      const { freq, time } = createHumanSpeechFrame();
+      vad.processFrame(freq, time);
+    }
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', 'Session continues seamlessly');
+    assert.equal(vad.silenceStartTime, null, 'silenceStartTime must be unconditionally reset to null');
+    assert.equal(vad.continuousSilenceSeconds, 0, 'continuousSilenceSeconds must be reset to 0');
+  });
+
+  test('Requirement 6b: Speak continuously for at least 30 seconds: session stays open without silence timer accumulating', () => {
+    let silenceTimeoutFired = false;
+    let countdownValues = [];
+
+    const vad = new VoiceActivityDetector({
+      sampleRate: 44100,
+      minCandidateFrames: 3,
+      silenceTimeoutSeconds: 15,
+      onSilenceCountdown: (rem) => { if (rem !== null) countdownValues.push(rem); },
+      onSilenceTimeout: () => { silenceTimeoutFired = true; },
+    });
+
+    // 1. Establish session
+    for (let i = 0; i < 4; i++) vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING');
+
+    // 2. Simulate 30 seconds of conversational speech with natural short syllable gaps (300ms)
+    // 30 seconds = 30 intervals of 1 second (each second has speech frames and micro-pauses)
+    for (let second = 0; second < 30; second++) {
+      // 800ms of active speech frames
+      for (let f = 0; f < 8; f++) {
+        vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
       }
+      // 200ms natural micro-gap between syllables
+      for (let f = 0; f < 2; f++) {
+        vad.processFrame(createQuietFrame().freq, createQuietFrame().time);
+      }
+      // Verify silence timer never builds up to 15s
+      assert.ok(vad.continuousSilenceSeconds < 2, 'Micro-gaps during continuous conversation must not accumulate');
+      assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', `Session must remain active at second ${second + 1}`);
     }
 
-    finalizeAndClose() {
-      this.state = 'SAVE_AND_CLOSE';
-      this.savedSessions.push({
-        sessionId: this.currentSessionId,
-        title: this.currentTitle,
-        savedAt: new Date().toISOString(),
-      });
-      this.currentSessionId = null;
-      this.currentTitle = null;
-      this.continuousSilenceSeconds = 0;
-      this.state = 'IDLE';
-    }
-  }
-
-  test('Scenario 1: Launch in quiet room: state remains IDLE, no session created', () => {
-    const sm = new MockSessionStateMachine();
-    assert.equal(sm.state, 'IDLE');
-
-    // Simulate 200 quiet frames
-    for (let i = 0; i < 200; i++) {
-      sm.onAudioFrame({ isSpeaking: false, elapsedSilenceSeconds: i * 0.1 });
-    }
-
-    assert.equal(sm.state, 'IDLE');
-    assert.equal(sm.sessionsCreated.length, 0, 'No session should be created in silence');
-    assert.equal(sm.currentSessionId, null);
+    assert.equal(silenceTimeoutFired, false, 'Silence timeout must never fire during continuous conversation');
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', 'Session must remain ACTIVE_RECORDING after 30+ seconds');
   });
 
-  test('Scenario 2: Speak a sentence: session automatically starts with unique ID and formatted title', () => {
-    const sm = new MockSessionStateMachine();
-    assert.equal(sm.state, 'IDLE');
+  test('Requirement 7: Continuous silence for 15 seconds: session triggers silence timeout and returns to IDLE', () => {
+    let silenceTimeoutFired = false;
 
-    // User speaks
-    sm.onAudioFrame({ isSpeaking: true });
+    const vad = new VoiceActivityDetector({
+      sampleRate: 44100,
+      minCandidateFrames: 3,
+      silenceTimeoutSeconds: 15,
+      onSilenceTimeout: () => { silenceTimeoutFired = true; },
+    });
 
-    assert.equal(sm.state, 'ACTIVE_SESSION');
-    assert.equal(sm.sessionsCreated.length, 1);
-    assert.ok(sm.currentSessionId.startsWith('sess_'));
-    assert.ok(sm.currentTitle.startsWith('Conversation -'));
+    // Start session
+    for (let i = 0; i < 5; i++) vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING');
+
+    // Simulate 15.1 seconds of elapsed silence
+    vad.silenceStartTime = Date.now() - 15200;
+    vad.processFrame(createQuietFrame().freq, createQuietFrame().time);
+
+    assert.ok(silenceTimeoutFired, '15s silence timeout must fire');
+    assert.equal(vad.lifecycleState, 'IDLE', 'State must return to IDLE');
   });
 
-  test('Scenario 3: Continue speaking: session remains active and silence timer stays 0', () => {
-    const sm = new MockSessionStateMachine();
-    sm.onAudioFrame({ isSpeaking: true });
+  test('Requirement 8: Background noise after speech ends does NOT prevent session from closing', () => {
+    let silenceTimeoutFired = false;
 
-    // Ongoing speech
-    for (let i = 0; i < 50; i++) {
-      sm.onAudioFrame({ isSpeaking: true });
-    }
+    const vad = new VoiceActivityDetector({
+      sampleRate: 44100,
+      minCandidateFrames: 3,
+      silenceTimeoutSeconds: 15,
+      onSilenceTimeout: () => { silenceTimeoutFired = true; },
+    });
 
-    assert.equal(sm.state, 'ACTIVE_SESSION');
-    assert.equal(sm.continuousSilenceSeconds, 0);
+    // Start active recording with speech
+    for (let i = 0; i < 5; i++) vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING');
+
+    // Background fan noise continues while speaker has stopped talking
+    vad.silenceStartTime = Date.now() - 15200;
+    // Feed fan noise frame
+    const res = vad.processFrame(createFanNoiseFrame().freq, createFanNoiseFrame().time);
+
+    assert.equal(res.isSpeech, false, 'Fan noise must be classified as non-speech during active session');
+    assert.ok(silenceTimeoutFired, 'Background fan noise must NOT prevent session closure');
+    assert.equal(vad.lifecycleState, 'IDLE');
   });
 
-  test('Scenario 4: Pause for less than 15 seconds (e.g. 8s) and resume: same session continues', () => {
-    const sm = new MockSessionStateMachine();
-    sm.onAudioFrame({ isSpeaking: true });
-    const initialSessionId = sm.currentSessionId;
+  test('Requirement 9: A new spoken conversation after closure starts a new session', () => {
+    const vad = new VoiceActivityDetector({ sampleRate: 44100, minCandidateFrames: 3 });
 
-    // Pause for 8 seconds
-    sm.onAudioFrame({ isSpeaking: false, elapsedSilenceSeconds: 8 });
-    assert.equal(sm.state, 'ACTIVE_SESSION');
-    assert.equal(sm.continuousSilenceSeconds, 8);
+    // Session 1
+    for (let i = 0; i < 5; i++) vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING');
+    vad.reset();
+    assert.equal(vad.lifecycleState, 'IDLE');
 
-    // Speech resumes
-    sm.onAudioFrame({ isSpeaking: true });
-    assert.equal(sm.state, 'ACTIVE_SESSION');
-    assert.equal(sm.continuousSilenceSeconds, 0, 'Silence counter should reset upon speech resumption');
-    assert.equal(sm.currentSessionId, initialSessionId, 'Must continue the exact same session');
-    assert.equal(sm.sessionsCreated.length, 1);
-  });
-
-  test('Scenario 5: 15 continuous seconds of silence: session closes, saves, and returns to IDLE', () => {
-    const sm = new MockSessionStateMachine();
-    sm.onAudioFrame({ isSpeaking: true });
-    const activeId = sm.currentSessionId;
-
-    // Silence reaches 15s
-    sm.onAudioFrame({ isSpeaking: false, elapsedSilenceSeconds: 15 });
-
-    assert.equal(sm.state, 'IDLE', 'State must return to IDLE after save');
-    assert.equal(sm.savedSessions.length, 1);
-    assert.equal(sm.savedSessions[0].sessionId, activeId);
-    assert.equal(sm.currentSessionId, null);
-  });
-
-  test('Scenario 6: Speak again: a new session with new session ID starts automatically', () => {
-    const sm = new MockSessionStateMachine();
-    // First session
-    sm.onAudioFrame({ isSpeaking: true });
-    const firstId = sm.currentSessionId;
-    sm.onAudioFrame({ isSpeaking: false, elapsedSilenceSeconds: 15 });
-    assert.equal(sm.state, 'IDLE');
-
-    // Second session
-    sm.onAudioFrame({ isSpeaking: true });
-    assert.equal(sm.state, 'ACTIVE_SESSION');
-    const secondId = sm.currentSessionId;
-
-    assert.notEqual(firstId, secondId, 'New session must have distinct session ID');
-    assert.equal(sm.sessionsCreated.length, 2);
-  });
-
-  test('Scenario 7: Prolonged silence (simulating 2 hours): no empty sessions created', () => {
-    const sm = new MockSessionStateMachine();
-    // 7200 seconds of continuous silence
-    for (let s = 1; s <= 7200; s += 60) {
-      sm.onAudioFrame({ isSpeaking: false, elapsedSilenceSeconds: s });
-    }
-
-    assert.equal(sm.state, 'IDLE');
-    assert.equal(sm.sessionsCreated.length, 0, 'Must never create empty sessions during prolonged silence');
-    assert.equal(sm.savedSessions.length, 0);
+    // Session 2
+    for (let i = 0; i < 5; i++) vad.processFrame(createHumanSpeechFrame().freq, createHumanSpeechFrame().time);
+    assert.equal(vad.lifecycleState, 'ACTIVE_RECORDING', 'Second conversation must start cleanly');
   });
 });
 
-describe('Module 4: English Translation Pipeline for Multilingual Speech', () => {
-  // Pure translation normalization logic corresponding to translationService.js
-  function processTranscriptSegment(rawText, sourceLanguage = 'es') {
-    // Known Spanish vocabulary mapping for tests
-    const spanishTranslations = {
-      'hola': 'hello',
-      'buenos dias': 'good morning',
-      'cuanto cuesta el iphone': 'how much is the iphone',
-      'quisiera comprar un telefono': 'I would like to buy a phone',
-      'puedo pagar con tarjeta': 'can I pay by card',
-    };
-
-    const lower = rawText.toLowerCase().trim();
-    let translated = rawText;
-    let wasTranslated = false;
-
-    if (spanishTranslations[lower]) {
-      translated = spanishTranslations[lower];
-      wasTranslated = true;
-    } else if (/[áéíóúñ¿¡]/.test(rawText) || lower.includes('iphone') && lower.includes('cuanto')) {
-      translated = 'How much is the iPhone';
-      wasTranslated = true;
-    }
-
-    return {
-      text: translated,
-      originalText: wasTranslated ? rawText : undefined,
-      isTranslated: wasTranslated,
-      sourceLanguage: wasTranslated ? sourceLanguage : 'en',
-      targetLanguage: 'en',
-    };
-  }
-
-  test('Scenario 8: Speak Spanish: verifies transcript text is converted into English while preserving metadata', () => {
-    const spanishInput = 'Hola, buenos dias';
-    const segment = processTranscriptSegment('Buenos dias', 'es');
-
-    assert.equal(segment.isTranslated, true);
-    assert.equal(segment.text, 'good morning');
-    assert.equal(segment.originalText, 'Buenos dias');
-    assert.equal(segment.sourceLanguage, 'es');
-    assert.equal(segment.targetLanguage, 'en');
-  });
-
-  test('English speech passes through directly without translation distortion', () => {
-    const englishInput = 'I would like to trade in my old iPhone.';
-    const segment = processTranscriptSegment(englishInput, 'en');
-
-    assert.equal(segment.isTranslated, false);
-    assert.equal(segment.text, englishInput);
-    assert.equal(segment.originalText, undefined);
-    assert.equal(segment.targetLanguage, 'en');
-  });
-});
-
-describe('Module 4: Session & Transcript Persistence Across Application Restart', () => {
+describe('Module 4: English Translation & Local Storage Persistence Verification', () => {
   let tempDir;
   let metadataPath;
   let transcriptsDir;
 
   before(() => {
-    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'storelistener-pers-test-'));
+    tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'storelistener-vad-test-'));
     const recordingsDir = path.join(tempDir, 'recordings');
     transcriptsDir = path.join(recordingsDir, 'transcripts');
     fs.mkdirSync(transcriptsDir, { recursive: true });
@@ -241,22 +310,20 @@ describe('Module 4: Session & Transcript Persistence Across Application Restart'
     }
   });
 
-  test('Scenario 9: Persisted recordings and transcripts remain accessible after restart', () => {
-    const sessionId = 'sess_1740001234_abc';
-    const recId = 'rec_store-01_1740001234_xyz';
+  test('Requirement 10: Saved audio and English translated transcript remain accessible after app restart', () => {
+    const sessionId = `sess_${Date.now()}_abc`;
+    const recId = `rec_store-01_${Date.now()}_xyz`;
 
-    // 1. Simulate saving recording session
     const record = {
       recordingId: recId,
       sessionId,
       title: 'Conversation - 12 Oct 2026, 03:45 PM',
-      durationSeconds: 32,
+      durationSeconds: 28,
       fileName: 'rec_store-01_1740001234_xyz.webm',
       savedAt: new Date().toISOString(),
     };
     fs.writeFileSync(metadataPath, JSON.stringify([record], null, 2), 'utf8');
 
-    // 2. Simulate saving English translated transcript
     const transcriptPayload = {
       recordingId: recId,
       sessionId,
@@ -266,15 +333,14 @@ describe('Module 4: Session & Transcript Persistence Across Application Restart'
         {
           segmentId: 'seg_1',
           speaker: 0,
-          text: 'Good morning, how can I help you?',
+          text: 'Hello, how can I help you today?',
           isTranslated: false,
-          targetLanguage: 'en',
         },
         {
           segmentId: 'seg_2',
           speaker: 1,
-          text: 'I would like to buy a phone',
-          originalText: 'Quisiera comprar un telefono',
+          text: 'How much does the iPhone 16 Pro cost?',
+          originalText: 'Cuánto cuesta el iPhone 16 Pro',
           isTranslated: true,
           sourceLanguage: 'es',
           targetLanguage: 'en',
@@ -283,18 +349,15 @@ describe('Module 4: Session & Transcript Persistence Across Application Restart'
     };
     fs.writeFileSync(path.join(transcriptsDir, `${recId}.json`), JSON.stringify(transcriptPayload, null, 2), 'utf8');
 
-    // 3. Simulate App Restart: read fresh from disk
-    assert.ok(fs.existsSync(metadataPath));
+    // Simulate restart: read fresh from disk
     const reloadedRecords = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
     assert.equal(reloadedRecords.length, 1);
-    assert.equal(reloadedRecords[0].title, 'Conversation - 12 Oct 2026, 03:45 PM');
+    assert.equal(reloadedRecords[0].recordingId, recId);
 
-    const transcriptFile = path.join(transcriptsDir, `${reloadedRecords[0].recordingId}.json`);
-    assert.ok(fs.existsSync(transcriptFile));
-    const reloadedTranscript = JSON.parse(fs.readFileSync(transcriptFile, 'utf8'));
-    assert.equal(reloadedTranscript.segments.length, 2);
-    assert.equal(reloadedTranscript.segments[1].text, 'I would like to buy a phone');
-    assert.equal(reloadedTranscript.segments[1].originalText, 'Quisiera comprar un telefono');
-    assert.equal(reloadedTranscript.segments[1].isTranslated, true);
+    const reloadedTr = JSON.parse(fs.readFileSync(path.join(transcriptsDir, `${recId}.json`), 'utf8'));
+    assert.equal(reloadedTr.segments.length, 2);
+    assert.equal(reloadedTr.segments[1].text, 'How much does the iPhone 16 Pro cost?');
+    assert.equal(reloadedTr.segments[1].isTranslated, true);
+    assert.equal(reloadedTr.segments[1].originalText, 'Cuánto cuesta el iPhone 16 Pro');
   });
 });
