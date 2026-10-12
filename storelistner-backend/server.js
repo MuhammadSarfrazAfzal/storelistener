@@ -151,7 +151,8 @@ io.on('connection', (socket) => {
       const {
         sessionId,
         storeCode = 'STORE-NYC-01',
-        language = 'en',
+        language = 'multi',
+        targetLanguage = 'en',
         model = 'nova-3',
         authToken,
       } = payload;
@@ -181,12 +182,13 @@ io.on('connection', (socket) => {
         activeSTTSessions.delete(socket.id);
       }
 
-      console.log(`🎙️ [STT] Starting streaming session ${sessionId} for socket ${socket.id} (model: ${model})`);
+      console.log(`🎙️ [STT] Starting streaming session ${sessionId} for socket ${socket.id} (model: ${model}, lang: ${language} -> target: ${targetLanguage})`);
 
       const sessionController = createStreamingSession({
         sessionId,
         storeCode,
         language,
+        targetLanguage,
         model,
         onSegment: (segment) => {
           // Send to the active desktop recorder

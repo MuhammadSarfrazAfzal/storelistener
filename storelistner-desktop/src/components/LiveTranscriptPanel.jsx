@@ -68,7 +68,7 @@ export default function LiveTranscriptPanel({
             />
           }
           size="small"
-          label="Deepgram Nova-3 Active"
+          label="Deepgram Nova-3 + English Translation Active"
           sx={{
             bgcolor: '#F0FDF4',
             color: '#15803D',
@@ -355,6 +355,22 @@ export default function LiveTranscriptPanel({
                         border: '1px solid #BBF7D0',
                       }}
                     />
+                    {seg.isTranslated && (
+                      <Tooltip title={seg.originalText ? `Original: "${seg.originalText}"` : 'Translated from source speech'}>
+                        <Chip
+                          size="small"
+                          label={`Translated (${seg.sourceLanguage || 'es'} -> en)`}
+                          sx={{
+                            height: 18,
+                            fontSize: '0.625rem',
+                            fontWeight: 700,
+                            bgcolor: '#EEF2FF',
+                            color: '#4338CA',
+                            border: '1px solid #C7D2FE',
+                          }}
+                        />
+                      </Tooltip>
+                    )}
                   </Stack>
                   <Typography
                     variant="body2"

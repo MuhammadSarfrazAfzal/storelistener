@@ -151,7 +151,8 @@ class TranscriptionClient {
     storeId,
     storeCode,
     title,
-    language = 'en',
+    language = 'multi',
+    targetLanguage = 'en',
     model = 'nova-3',
     onSegment,
     onStatus,
@@ -167,6 +168,7 @@ class TranscriptionClient {
       storeCode: storeCode || storeId || 'store-01',
       title,
       language,
+      targetLanguage,
       model,
       authToken,
     };

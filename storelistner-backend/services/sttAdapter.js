@@ -12,13 +12,15 @@
  */
 
 const WebSocket = require('ws');
+const { translateToEnglish } = require('./translationService');
 
 /**
  * Creates a real-time streaming STT session
  * @param {Object} options
  * @param {string} options.sessionId - Unique conversation session ID
  * @param {string} options.storeCode - Store identifier (e.g., 'STORE-NYC-01')
- * @param {string} options.language - Language code (default: 'en')
+ * @param {string} options.language - Language code (default: 'multi' for multilingual / Spanish)
+ * @param {string} options.targetLanguage - Target output language (default: 'en')
  * @param {string} options.model - Model name (default: 'nova-3')
  * @param {Function} options.onSegment - Callback when transcript segment arrives
  * @param {Function} options.onStatus - Callback for connection status updates
@@ -29,7 +31,8 @@ const WebSocket = require('ws');
 function createStreamingSession({
   sessionId,
   storeCode = 'STORE-NYC-01',
-  language = 'en',
+  language = 'multi',
+  targetLanguage = 'en',
   model = 'nova-3',
   onSegment,
   onStatus,
@@ -60,15 +63,15 @@ function createStreamingSession({
 
   // 2. Build Deepgram WebSocket URL
   // Parameters verified per Deepgram official documentation:
-  // - model: 'nova-3' or 'nova-2'
-  // - language: language code ('en', 'en-US', etc.)
+  // - model: 'nova-3'
+  // - language: 'multi' enables multilingual recognition (Spanish, English, etc.)
   // - smart_format: true (auto-formats dates, numbers, currency)
   // - punctuate: true
   // - interim_results: true (delivers streaming partials)
   // - diarize: true (identifies speaker turns)
   const queryParams = new URLSearchParams({
-    model: process.env.DEEPGRAM_MODEL || model,
-    language: language.startsWith('ur') ? 'ur' : language.startsWith('pa') ? 'pa' : 'en',
+    model: process.env.DEEPGRAM_MODEL || model || 'nova-3',
+    language: 'multi',
     smart_format: 'true',
     punctuate: 'true',
     interim_results: 'true',
@@ -125,7 +128,7 @@ function createStreamingSession({
       }
     });
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
       try {
         const message = JSON.parse(data.toString());
 
@@ -150,11 +153,33 @@ function createStreamingSession({
             const duration = typeof message.duration === 'number' ? message.duration : null;
             const endTime = startTime !== null && duration !== null ? Number((startTime + duration).toFixed(2)) : null;
 
+            // Perform English translation pipeline for multilingual speech (Spanish, etc.)
+            let englishText = transcriptText;
+            let originalText = transcriptText;
+            let wasTranslated = false;
+            let sourceLanguage = 'en';
+
+            try {
+              const translationResult = await translateToEnglish(transcriptText);
+              if (translationResult) {
+                englishText = translationResult.englishText || transcriptText;
+                originalText = translationResult.originalText || transcriptText;
+                wasTranslated = translationResult.wasTranslated || false;
+                sourceLanguage = translationResult.sourceLanguage || 'en';
+              }
+            } catch (transErr) {
+              console.warn(`[STT Translation] Note for session ${sessionId}:`, transErr.message);
+            }
+
             const segment = {
               segmentId: `seg_${sessionId}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
               sessionId,
               speaker: speakerLabel || 'Speaker',
-              text: transcriptText,
+              text: englishText,
+              originalText: wasTranslated ? originalText : undefined,
+              isTranslated: wasTranslated,
+              sourceLanguage,
+              targetLanguage: 'en',
               confidence: alternative.confidence || 0.95,
               startTime,
               endTime,
